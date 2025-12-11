@@ -32,10 +32,14 @@ def main():
 
     model_type = "generator_ema" if use_ema else "generator"
     
-    # Check if 'generator' key exists
+    # Check if generator key exists, fallback to plain generator
     if model_type not in checkpoint:
-        print(f"Error: The '{model_type}' key does not exist in the input checkpoint")
-        return
+        if "generator" in checkpoint:
+            print(f"'{model_type}' not found, falling back to 'generator'")
+            model_type = "generator"
+        else:
+            print(f"Error: Neither '{model_type}' nor 'generator' key exists in the input checkpoint")
+            return
     
     # Extract the generator
     generator = checkpoint[model_type]

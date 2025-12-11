@@ -21,9 +21,12 @@ num_frames: 81
 
 # LoRA (optional). Set lora_rank > 0 to enable LoRA adapters on generator/fake_score.
 lora_rank: 0
+lora_rank_critic: 0
 lora_alpha: 4.0
 lora_dropout: 0.0
 lora_apply_to_high_noise: false
+lora_path_style: ""
+lora_path_style_role: generator
 lora_path_generator: ""
 lora_path_fake_score: ""
 lora_path_high_noise: ""

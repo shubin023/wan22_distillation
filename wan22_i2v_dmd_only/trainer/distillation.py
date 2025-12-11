@@ -5,22 +5,19 @@ import logging  # lightweight logging for GC events
 from utils.dataset import ShardingLMDBDataset, cycle
 from utils.dataset import TextDataset, TextFolderDataset
 
-# Distributed helpers: FSDP EMA wrapper, FSDP wrapping/state_dict helpers, process group launcher
-from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
-
 # Misc helpers: deterministic seeding and merging multiple log dicts
 from utils.misc import (
     set_seed,
     merge_dict_list
 )
 
-import torch.distributed as dist  # PyTorch distributed primitives (rank/world_size)
 from omegaconf import OmegaConf  # config container/merging
 from model import DMD  # the only distribution-matching model we keep in this project
 import torch  # tensor ops and optimizers
 import wandb  # optional experiment logging
 import time  # simple wall-clock timing
 import os  # filesystem utilities
+from torch.nn.utils import clip_grad_norm_
 
 
 class Trainer:
@@ -33,27 +30,22 @@ class Trainer:
         self.config = config  # hydra/omegaconf config merged in train.py
         self.step = 0  # global training step counter
 
-        # Step 1: Initialize distributed training (process group, device, dtype, logging/seed)
+        # Step 1: Initialize device/dtype, logging/seed for single-GPU training
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-        launch_distributed_job()
-        global_rank = dist.get_rank()  # integer rank within the world
-        self.world_size = dist.get_world_size()  # total number of ranks
-
         self.dtype = torch.bfloat16 if config.mixed_precision else torch.float32  # compute dtype
-        self.device = torch.cuda.current_device()  # current CUDA device for this rank
-        self.is_main_process = global_rank == 0  # used to gate logging/checkpointing
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.is_main_process = True  # single-process training
         self.causal = config.causal  # kept for API parity; not used in this DMD-only fork
         self.disable_wandb = config.disable_wandb  # whether to skip wandb logging
 
         # use a random seed for the training
         if config.seed == 0:
             random_seed = torch.randint(0, 10000000, (1,), device=self.device)
-            dist.broadcast(random_seed, src=0)
             config.seed = random_seed.item()
 
-        set_seed(config.seed + global_rank)  # rank-dependent seed for reproducibility
+        set_seed(config.seed)  # seed for reproducibility
 
         if self.is_main_process and not self.disable_wandb:
             wandb.login(host=config.wandb_host, key=config.wandb_key)
@@ -74,48 +66,9 @@ class Trainer:
         else:
             raise ValueError("Invalid distribution matching loss: only 'dmd' is supported in this project")
 
-        # Save pretrained critic weights on CPU in case we need to restore them
-        self.fake_score_state_dict_cpu = self.model.fake_score.state_dict()
-
-        # FSDP wrap generator (student), real_score (teacher), and fake_score (critic)
-        self.model.generator = fsdp_wrap(
-            self.model.generator,
-            sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
-            wrap_strategy=config.generator_fsdp_wrap_strategy
-        )
-
-        self.model.real_score = fsdp_wrap(
-            self.model.real_score,
-            sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
-            wrap_strategy=config.real_score_fsdp_wrap_strategy
-        )
-
-        self.model.fake_score = fsdp_wrap(
-            self.model.fake_score,
-            sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
-            wrap_strategy=config.fake_score_fsdp_wrap_strategy
-        )
-
-        self.model.text_encoder = fsdp_wrap(
-            self.model.text_encoder,
-            sharding_strategy=config.sharding_strategy,
-            mixed_precision=config.mixed_precision,
-            wrap_strategy=config.text_encoder_fsdp_wrap_strategy,
-            cpu_offload=getattr(config, "text_encoder_cpu_offload", False)
-        )
-
-        # In low-noise stage, also wrap the frozen high-noise model used to produce x_bound
+        # Move ancillary modules to device
         if self.config.training_target == "low_noise":
-            self.model.high_noise_model = fsdp_wrap(
-                self.model.high_noise_model,
-                sharding_strategy=config.sharding_strategy,
-                mixed_precision=config.mixed_precision,
-                wrap_strategy=config.high_noise_model_fsdp_wrap_strategy
-            )
-            self.high_noise_step_list = torch.tensor(config.high_noise_step_list, dtype=torch.long)
+            self.high_noise_step_list = torch.tensor(config.high_noise_step_list, dtype=torch.long, device=self.device)
 
         if self.config.i2v:
             self.model.vae = self.model.vae.to(
@@ -125,22 +78,25 @@ class Trainer:
             self.model.vae = self.model.vae.to(
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
-        # Optimizers: generator (student) and fake_score (critic)
+        # Optimizers: split params by adapter role to avoid cross-updating LoRAs
+        gen_params = [p for n, p in self.model.generator.named_parameters()
+                      if p.requires_grad and "lora_" in n and "_generator" in n]
+        critic_params = [p for n, p in self.model.fake_score.named_parameters()
+                         if p.requires_grad and "lora_" in n and "_critic" in n]
+
         self.generator_optimizer = torch.optim.AdamW(
-            [param for param in self.model.generator.parameters()
-             if param.requires_grad],
+            gen_params,
             lr=config.lr,
             betas=(config.beta1, config.beta2),
             weight_decay=config.weight_decay
-        )
+        ) if gen_params else None
 
         self.critic_optimizer = torch.optim.AdamW(
-            [param for param in self.model.fake_score.parameters()
-             if param.requires_grad],
+            critic_params,
             lr=config.lr_critic if hasattr(config, "lr_critic") else config.lr,
             betas=(config.beta1_critic, config.beta2_critic),
             weight_decay=config.weight_decay
-        )
+        ) if critic_params else None
 
         # Step 3: Initialize the dataloader
         if self.config.i2v:
@@ -154,38 +110,15 @@ class Trainer:
             else:
                 raise ValueError("Invalid data type")
             
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset, shuffle=True, drop_last=True)
         dataloader = torch.utils.data.DataLoader(
             dataset,
             batch_size=config.batch_size,
-            sampler=sampler,
+            shuffle=True,
             num_workers=8)
 
-        if dist.get_rank() == 0:
+        if self.is_main_process:
             print("DATASET SIZE %d" % len(dataset))
         self.dataloader = cycle(dataloader)
-
-        ##############################################################################################################
-        # 6. Set up EMA parameter containers
-        rename_param = (
-            lambda name: name.replace("_fsdp_wrapped_module.", "")
-            .replace("_checkpoint_wrapped_module.", "")
-            .replace("_orig_mod.", "")
-        )
-        self.name_to_trainable_params = {}  # map clean param names -> tensors for possible logging/export
-        for n, p in self.model.generator.named_parameters():
-            if not p.requires_grad:
-                continue
-
-            renamed_n = rename_param(n)
-            self.name_to_trainable_params[renamed_n] = p
-        self.ema_weight = config.get("ema_weight", -1.0)
-        self.ema_start_step = config.get("ema_start_step", 0)
-        self.generator_ema = None
-        if (self.ema_weight > 0.0) and (self.step >= self.ema_start_step):
-            print(f"Setting up EMA with weight {self.ema_weight}")
-            self.generator_ema = EMA_FSDP(self.model.generator, decay=self.ema_weight)
 
         ##############################################################################################################
         # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
@@ -197,72 +130,39 @@ class Trainer:
                 self.step = config.resume_step
                 print(f"Resuming from step {self.step}")
 
-            # Load generator_ema checkpoint (if exists)
-            generator_ema_path = os.path.join(config.resume_ckpt, "generator_ema.pt")
-            if os.path.exists(generator_ema_path):
-                # Initialize EMA if not already initialized (needed for loading state)
-                if self.generator_ema is None and self.ema_weight > 0.0:
-                    print("Initializing EMA for resume...")
-                    generator_state_dict = torch.load(generator_ema_path, map_location="cpu")
-                    # FSDP will automatically handle dtype conversion
-                    self.model.generator.load_state_dict(generator_state_dict, strict=True)
-                    self.generator_ema = EMA_FSDP(self.model.generator, decay=self.ema_weight)
-                    print("Generator EMA checkpoint loaded successfully")
-            else:
-                print(f"Info: Generator EMA checkpoint not found at {generator_ema_path}")
-
             # Load generator checkpoint
-            generator_path = os.path.join(config.resume_ckpt, "generator.pt")
-            if os.path.exists(generator_path):
-                print(f"Loading generator from {generator_path}")
-                generator_state_dict = torch.load(generator_path, map_location="cpu")
-                # FSDP will automatically handle dtype conversion
-                self.model.generator.load_state_dict(generator_state_dict, strict=True)
-                print("Generator checkpoint loaded successfully")
+            # Load LoRA adapters if present
+            lora_path = os.path.join(config.resume_ckpt, "model.pt")
+            if os.path.exists(lora_path):
+                print(f"Loading LoRA adapters from {lora_path}")
+                lora_state = torch.load(lora_path, map_location="cpu")
+                gen_lora = lora_state.get("generator_lora", {})
+                critic_lora = lora_state.get("critic_lora", {})
+                if gen_lora:
+                    self.model.generator.load_state_dict(gen_lora, strict=False)
+                    print("Generator LoRA loaded successfully")
+                if critic_lora:
+                    self.model.fake_score.load_state_dict(critic_lora, strict=False)
+                    print("Critic LoRA loaded successfully")
             else:
-                print(f"Warning: Generator checkpoint not found at {generator_path}")
-
-            # Load critic checkpoint
-            critic_path = os.path.join(config.resume_ckpt, "critic.pt")
-            if os.path.exists(critic_path):
-                print(f"Loading critic from {critic_path}")
-                critic_state_dict = torch.load(critic_path, map_location="cpu")
-                # FSDP will automatically handle dtype conversion
-                self.model.fake_score.load_state_dict(critic_state_dict, strict=True)
-                print("Critic checkpoint loaded successfully")
-            else:
-                print(f"Warning: Critic checkpoint not found at {critic_path}")
+                print(f"Warning: LoRA checkpoint not found at {lora_path}")
         
 
         ##############################################################################################################
-
-        # Let's delete EMA params for early steps to save some computes at training and inference
-        # if self.step < config.ema_start_step:
-        #     self.generator_ema = None
 
         self.max_grad_norm_generator = getattr(config, "max_grad_norm_generator", 10.0)
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
         self.previous_time = None
 
     def save(self):
-        print("Start gathering distributed model states...")
-        generator_state_dict = fsdp_state_dict(
-            self.model.generator)
-        critic_state_dict = fsdp_state_dict(
-            self.model.fake_score)
-
-        # Persist EMA if it is active
-        if (self.ema_weight > 0.0) and (self.ema_start_step < self.step):
-            state_dict = {
-                "generator": generator_state_dict,
-                "critic": critic_state_dict,
-                "generator_ema": self.generator_ema.state_dict(),
-            }
-        else:
-            state_dict = {
-                "generator": generator_state_dict,
-                "critic": critic_state_dict,
-            }
+        print("Start gathering model states...")
+        # Save only the LoRA adapter weights for generator/critic roles (shared backbone stays frozen)
+        gen_lora = {k: v for k, v in self.model.generator.state_dict().items() if "lora_" in k and "_generator" in k}
+        critic_lora = {k: v for k, v in self.model.fake_score.state_dict().items() if "lora_" in k and "_critic" in k}
+        state_dict = {
+            "generator_lora": gen_lora,
+            "critic_lora": critic_lora,
+        }
 
         if self.is_main_process:
             os.makedirs(os.path.join(self.output_path,
@@ -368,8 +268,13 @@ class Trainer:
             torch.cuda.empty_cache()
 
             generator_loss.backward()
-            generator_grad_norm = self.model.generator.clip_grad_norm_(
-                self.max_grad_norm_generator)
+            if self.generator_optimizer is not None:
+                generator_grad_norm = clip_grad_norm_(
+                    [p for p in self.model.generator.parameters() if p.requires_grad],
+                    self.max_grad_norm_generator
+                )
+            else:
+                generator_grad_norm = torch.tensor(0.0, device=self.device)
 
             generator_log_dict.update({"generator_loss": generator_loss,
                                        "generator_grad_norm": generator_grad_norm})
@@ -389,8 +294,13 @@ class Trainer:
         )
 
         critic_loss.backward()
-        critic_grad_norm = self.model.fake_score.clip_grad_norm_(
-            self.max_grad_norm_critic)
+        if self.critic_optimizer is not None:
+            critic_grad_norm = clip_grad_norm_(
+                [p for p in self.model.fake_score.parameters() if p.requires_grad],
+                self.max_grad_norm_critic
+            )
+        else:
+            critic_grad_norm = torch.tensor(0.0, device=self.device)
 
         critic_log_dict.update({"critic_loss": critic_loss,
                                 "critic_grad_norm": critic_grad_norm})
@@ -442,7 +352,7 @@ class Trainer:
             TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
 
             # Alternate updates: generator every dfake_gen_update_ratio steps, critic every step
-            if TRAIN_GENERATOR:
+            if TRAIN_GENERATOR and self.generator_optimizer is not None:
                 self.generator_optimizer.zero_grad(set_to_none=True)
                 extras_list = []
                 batch = next(self.dataloader)
@@ -450,25 +360,21 @@ class Trainer:
                 extras_list.append(extra)
                 generator_log_dict = merge_dict_list(extras_list)
                 self.generator_optimizer.step()
-            if self.generator_ema is not None:
-                self.generator_ema.update(self.model.generator)
 
             # Train the critic
-            self.critic_optimizer.zero_grad(set_to_none=True)
-            extras_list = []
-            batch = next(self.dataloader)
-            extra = self.fwdbwd_one_step(batch, False)
-            extras_list.append(extra)
-            critic_log_dict = merge_dict_list(extras_list)
-            self.critic_optimizer.step()
+            if self.critic_optimizer is not None:
+                self.critic_optimizer.zero_grad(set_to_none=True)
+                extras_list = []
+                batch = next(self.dataloader)
+                extra = self.fwdbwd_one_step(batch, False)
+                extras_list.append(extra)
+                critic_log_dict = merge_dict_list(extras_list)
+                self.critic_optimizer.step()
+            else:
+                critic_log_dict = {}
 
             # Increment the step since we finished gradient update
             self.step += 1
-
-            # Create EMA params (if not already created)
-            if (self.step >= self.ema_start_step) and \
-                    (self.generator_ema is None) and (self.ema_weight > 0):
-                self.generator_ema = EMA_FSDP(self.model.generator, decay=self.ema_weight)
 
             # Save the model
             if (not self.config.no_save) and (self.step - start_step) > 0 and self.step % self.config.log_iters == 0:
@@ -488,19 +394,19 @@ class Trainer:
                         }
                     )
 
-                wandb_loss_dict.update(
-                    {
-                        "critic_loss": critic_log_dict["critic_loss"].mean().item(),
-                        "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
-                    }
-                )
+                if critic_log_dict:
+                    wandb_loss_dict.update(
+                        {
+                            "critic_loss": critic_log_dict["critic_loss"].mean().item(),
+                            "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
+                        }
+                    )
 
                 if not self.disable_wandb:
                     wandb.log(wandb_loss_dict, step=self.step)
 
             if self.step % self.config.gc_interval == 0:
-                if dist.get_rank() == 0:
-                    logging.info("DistGarbageCollector: Running GC.")
+                logging.info("DistGarbageCollector: Running GC.")
                 gc.collect()
                 torch.cuda.empty_cache()
 

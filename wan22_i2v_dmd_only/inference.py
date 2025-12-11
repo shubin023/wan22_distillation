@@ -63,7 +63,10 @@ else:
 
 if args.checkpoint_path:
     state_dict = torch.load(args.checkpoint_path, map_location="cpu")
-    pipeline.generator.load_state_dict(state_dict['generator' if not args.use_ema else 'generator_ema'])
+    if args.use_ema and 'generator_ema' in state_dict:
+        pipeline.generator.load_state_dict(state_dict['generator_ema'])
+    else:
+        pipeline.generator.load_state_dict(state_dict['generator'])
 
 pipeline = pipeline.to(device=device, dtype=torch.bfloat16)
 

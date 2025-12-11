@@ -34,59 +34,44 @@ class BaseModel(nn.Module):
         self.real_model_name = getattr(args, "real_name", "Wan2.2-T2V-A14B")
         self.fake_model_name = getattr(args, "fake_name", "Wan2.2-T2V-A14B")
         self.generator_name = getattr(args, "generator_name", "Wan2.2-T2V-A14B")
-        lora_rank = getattr(args, "lora_rank", 0)
+        lora_rank_gen = getattr(args, "lora_rank", 0)
+        lora_rank_critic = getattr(args, "lora_rank_critic", lora_rank_gen)
         lora_alpha = getattr(args, "lora_alpha", 4.0)
         lora_dropout = getattr(args, "lora_dropout", 0.0)
         apply_lora_high = getattr(args, "lora_apply_to_high_noise", False)
+        lora_path_style = getattr(args, "lora_path_style", "")
+        lora_style_role = getattr(args, "lora_path_style_role", "generator")
         lora_path_generator = getattr(args, "lora_path_generator", "")
         lora_path_fake = getattr(args, "lora_path_fake_score", "")
         lora_path_high = getattr(args, "lora_path_high_noise", "")
 
-        self.generator = WanDiffusionWrapper(
+        # Shared backbone with dual-role LoRAs; base weights frozen
+        shared = WanDiffusionWrapper(
             **getattr(args, "model_kwargs", {}),
             model_name=self.generator_name,
             is_causal=self.is_causal,
             timestep_bound=self.boundary_step,
             target=self.training_target,
-            lora_rank=lora_rank,
+            lora_rank=max(lora_rank_gen, lora_rank_critic),
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
             apply_lora=True,
             train_lora_only=True
         )
-        # only LoRA params are trainable; backbone frozen
-        self.generator.set_adapter_role("generator")
-        self.generator.model.requires_grad_(False)
-        if lora_rank > 0 and lora_path_generator:
-            self.generator.load_lora(lora_path_generator, adapter_role="generator")
+        shared.set_adapter_role("generator")
+        # Optionally merge a style LoRA into the base weights before training adapters
+        if lora_path_style:
+            shared.load_lora(lora_path_style, adapter_role=lora_style_role)
+            merge_lora_weights(shared.model, adapter_role=lora_style_role)
+        if lora_rank_gen > 0 and lora_path_generator:
+            shared.load_lora(lora_path_generator, adapter_role="generator")
+        if lora_rank_critic > 0 and lora_path_fake:
+            shared.load_lora(lora_path_fake, adapter_role="critic")
 
-        self.real_score = WanDiffusionWrapper(
-            **getattr(args, "model_kwargs", {}),
-            model_name=self.real_model_name,
-            is_causal=False,
-            timestep_bound=self.boundary_step,
-            target=self.training_target,
-            lora_rank=0,  # keep teacher frozen, no LoRA
-            apply_lora=False
-        )
-        self.real_score.model.requires_grad_(False)
-
-        self.fake_score = WanDiffusionWrapper(
-            **getattr(args, "model_kwargs", {}),
-            model_name=self.fake_model_name,
-            is_causal=False,
-            timestep_bound=self.boundary_step,
-            target=self.training_target,
-            lora_rank=lora_rank,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            apply_lora=True,
-            train_lora_only=True
-        )
-        self.fake_score.set_adapter_role("critic")
-        self.fake_score.model.requires_grad_(False)
-        if lora_rank > 0 and lora_path_fake:
-            self.fake_score.load_lora(lora_path_fake, adapter_role="critic")
+        # Reuse the same module for generator, critic, and teacher (LoRA disabled via adapter_role)
+        self.generator = shared
+        self.fake_score = shared
+        self.real_score = shared
 
         if self.training_target == "low_noise":
             self.high_noise_name = getattr(args, "high_noise_name", "Wan2.2-T2V-A14B")

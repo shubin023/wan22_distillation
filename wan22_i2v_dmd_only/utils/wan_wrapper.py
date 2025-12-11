@@ -377,9 +377,12 @@ class WanDiffusionWrapper(torch.nn.Module):
         clean_x: Optional[torch.Tensor] = None,
         aug_t: Optional[torch.Tensor] = None,
         cache_start: Optional[int] = None,
-        y: Optional[torch.Tensor] = None
+        y: Optional[torch.Tensor] = None,
+        adapter_role: Optional[str] = None
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
+        if adapter_role is not None:
+            self.set_adapter_role(adapter_role)
 
         self.scheduler.timesteps = self.scheduler.timesteps.to(timestep_id.device)
         timestep = self.scheduler.timesteps[timestep_id]
@@ -503,11 +506,32 @@ class LoraLinear(nn.Module):
     def forward(self, x: torch.Tensor, adapter_role: Optional[str] = None) -> torch.Tensor:
         base = torch.nn.functional.linear(x, self.base_weight, self.base_bias)
         role = adapter_role or self.active_adapter
-        if role == "critic":
+        if role == "none":
+            lora_update = 0.0
+        elif role == "critic":
             lora_update = self.lora_B_critic(self.lora_A_critic(self.dropout(x))) * self.scaling
         else:
             lora_update = self.lora_B_generator(self.lora_A_generator(self.dropout(x))) * self.scaling
         return base + lora_update
+
+    def merge_lora(self, adapter_role: str = "generator", reset_after: bool = True):
+        """
+        Fold the specified adapter into the frozen base weight:
+        W := W + (B @ A) * scaling. Optionally zero the adapter weights afterward.
+        """
+        if adapter_role == "critic":
+            A = self.lora_A_critic.weight
+            B = self.lora_B_critic.weight
+        else:
+            A = self.lora_A_generator.weight
+            B = self.lora_B_generator.weight
+
+        delta = torch.matmul(B, A) * self.scaling  # [out, in]
+        with torch.no_grad():
+            self.base_weight.add_(delta)
+            if reset_after:
+                A.zero_()
+                B.zero_()
 
 
 def _load_lora_state_dict(path: str) -> dict:
@@ -587,3 +611,12 @@ def load_lora_weights(model: nn.Module, lora_path: str, adapter_role: str = "gen
         print(f"[LoRA] Missing keys (ignored): {missing}")
     if unexpected:
         print(f"[LoRA] Unexpected keys (ignored): {unexpected}")
+
+
+def merge_lora_weights(model: nn.Module, adapter_role: str = "generator"):
+    """
+    Merge the specified adapter into the base weights for all LoraLinear modules.
+    """
+    for m in model.modules():
+        if isinstance(m, LoraLinear):
+            m.merge_lora(adapter_role=adapter_role, reset_after=True)

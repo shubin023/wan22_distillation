@@ -91,7 +91,8 @@ class DMD(SelfForcingModel):
             noisy_image_or_video=noisy_image_or_video,
             conditional_dict=conditional_dict,
             timestep_id=timestep_id,
-            y=y
+            y=y,
+            adapter_role="critic"
         )
 
         # Step 2: Compute the real score
@@ -101,14 +102,16 @@ class DMD(SelfForcingModel):
             noisy_image_or_video=noisy_image_or_video,
             conditional_dict=conditional_dict,
             timestep_id=timestep_id,
-            y=y
+            y=y,
+            adapter_role="none"
         )
 
         _, pred_real_image_uncond = self.real_score(
             noisy_image_or_video=noisy_image_or_video,
             conditional_dict=unconditional_dict,
             timestep_id=timestep_id,
-            y=y
+            y=y,
+            adapter_role="none"
         )
 
         pred_real_image = pred_real_image_cond + (
@@ -228,6 +231,7 @@ class DMD(SelfForcingModel):
             - generator_log_dict: a dictionary containing the intermediate tensors for logging.
         """
         # Step 1: Unroll generator to obtain fake videos
+        self.generator.set_adapter_role("generator")
         flow_pred, pred_image, gradient_mask, noise = self._run_generator(
             image_or_video_shape=image_or_video_shape,
             conditional_dict=conditional_dict,
@@ -245,7 +249,7 @@ class DMD(SelfForcingModel):
             y=y
         )
 
-        if dist.get_rank() == 0:
+        if (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0:
             print(f"dmd_loss: {dmd_loss.item()}")
 
         del flow_pred, pred_image, gradient_mask
@@ -278,6 +282,7 @@ class DMD(SelfForcingModel):
 
         # Step 1: Run generator on backward simulated noisy input
         with torch.no_grad():
+            self.generator.set_adapter_role("generator")
             _, generated_image, _, _ = self._run_generator(
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
@@ -319,7 +324,8 @@ class DMD(SelfForcingModel):
             noisy_image_or_video=noisy_generated_image,
             conditional_dict=conditional_dict,
             timestep_id=critic_timestep_id,
-            y=y
+            y=y,
+            adapter_role="critic"
         )
         if self.training_target == "high_noise":
             self.scheduler.sigmas = self.scheduler.sigmas.to(noisy_generated_image.device)
@@ -333,7 +339,7 @@ class DMD(SelfForcingModel):
             s = self.sigma_bound.to(noisy_generated_image.device)
             fake_image = noisy_generated_image - flow_pred_fake * t
         denoising_loss = torch.mean((fake_image - generated_image) ** 2)
-        if dist.get_rank() == 0:
+        if (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0:
             print(f"denoising_loss: {denoising_loss.item()}")
 
         # Step 5: Debugging Log
