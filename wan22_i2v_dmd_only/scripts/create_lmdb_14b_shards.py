@@ -31,32 +31,24 @@ def main():
                         required=True, help="path to video folder")
     parser.add_argument("--lmdb_path", type=str,
                         required=True, help="path to lmdb")
-    parser.add_argument("--num_shards", type=int,
-                        default=16, help="num_shards")
 
     args = parser.parse_args()
 
     # figure out the maximum map size needed
     map_size = int(1e12)  # adapt to your need, set to 1TB by default
     os.makedirs(args.lmdb_path, exist_ok=True)
-    # 1) Open one LMDB env per shard
-    envs = []
-    num_shards = args.num_shards
-    for shard_id in range(num_shards):
-        print("shard_id ", shard_id)
-        path = os.path.join(args.lmdb_path, f"shard_{shard_id}")
-        env = lmdb.open(path,
-                        map_size=map_size,
-                        subdir=True,       # set to True if you want a directory per env
-                        readonly=False,
-                        metasync=True,
-                        sync=True,
-                        lock=True,
-                        readahead=False,
-                        meminit=False)
-        envs.append(env)
+    # Open a single LMDB env (no sharding)
+    env = lmdb.open(args.lmdb_path,
+                    map_size=map_size,
+                    subdir=True,
+                    readonly=False,
+                    metasync=True,
+                    sync=True,
+                    lock=True,
+                    readahead=False,
+                    meminit=False)
 
-    counters = [0] * num_shards
+    counter = 0
     seen_prompts = set()  # for deduplication
     neg_prompts = set()
     total_samples = 0
@@ -73,9 +65,9 @@ def main():
             try:
                 with open(prompt_file, 'r', encoding='utf-8') as f:
                     prompt_content = f.read().strip()
-                if len(prompt_content) < 300:
-                    neg_prompts.add(prompt_content)
-                    continue
+                # if len(prompt_content) < 300:
+                #     neg_prompts.add(prompt_content)
+                #     continue
                 filename = os.path.basename(prompt_file)
                 prompt_to_filename[prompt_content] = filename
             except Exception as e:
@@ -84,10 +76,10 @@ def main():
     else:
         print(f"Warning: Prompt path {args.prompt_path} does not exist.")
 
-    print("start negative prompts ---------------")
-    for prompt in neg_prompts:
-        print(prompt)
-    print("end negative prompts -----------------")
+    # print("start negative prompts ---------------")
+    # for prompt in neg_prompts:
+    #     print(prompt)
+    # print("end negative prompts -----------------")
 
     # 2) Prepare a write transaction for each shard
     for idx, file in tqdm(enumerate(all_files)):
@@ -98,11 +90,11 @@ def main():
             print(f"Error processing {file}: {e}")
             continue
 
-        if data_dict["latents"].shape != (1, 21, 16, 60, 104):
-            continue
+        # if data_dict["latents"].shape != (1, 21, 16, 60, 104):
+        #     continue
 
-        if len(data_dict['prompts'][0]) < 300:
-            continue
+        # if len(data_dict['prompts'][0]) < 300:
+        #     continue
         
         try:
             current_filename = os.path.basename(file)
@@ -134,28 +126,26 @@ def main():
             print(f"Error processing file {current_filename}: {e}")
             continue
 
-        shard_id = idx % num_shards
         # write to lmdb file
-        store_arrays_to_lmdb(envs[shard_id], data_dict, start_index=counters[shard_id])
-        counters[shard_id] += len(data_dict['prompts'])
+        store_arrays_to_lmdb(env, data_dict, start_index=counter)
+        counter += len(data_dict['prompts'])
         data_shape = data_dict["latents"].shape
         total_samples += 1
 
     print(len(seen_prompts))
 
     # save each entry's shape to lmdb
-    for shard_id, env in enumerate(envs):
-        with env.begin(write=True) as txn:
-            for key, val in (data_dict.items()):
-                assert len(data_shape) == 5
-                array_shape = np.array(data_shape)  # val.shape)
-                array_shape[0] = counters[shard_id]
-                shape_key = f"{key}_shape".encode()
-                print(shape_key, array_shape)
-                shape_str = " ".join(map(str, array_shape))
-                txn.put(shape_key, shape_str.encode())
+    with env.begin(write=True) as txn:
+        for key, val in (data_dict.items()):
+            assert len(data_shape) == 5
+            array_shape = np.array(data_shape)
+            array_shape[0] = counter
+            shape_key = f"{key}_shape".encode()
+            print(shape_key, array_shape)
+            shape_str = " ".join(map(str, array_shape))
+            txn.put(shape_key, shape_str.encode())
 
-    print(f"Total {len(all_files)} videos. Finished writing {total_samples} examples into {num_shards} shards under {args.lmdb_path}")
+    print(f"Total {len(all_files)} videos. Finished writing {total_samples} examples into a single lmdb under {args.lmdb_path}")
 
 
 if __name__ == "__main__":

@@ -39,8 +39,6 @@ class BaseModel(nn.Module):
         lora_alpha = getattr(args, "lora_alpha", 4.0)
         lora_dropout = getattr(args, "lora_dropout", 0.0)
         apply_lora_high = getattr(args, "lora_apply_to_high_noise", False)
-        lora_path_style = getattr(args, "lora_path_style", "")
-        lora_style_role = getattr(args, "lora_path_style_role", "generator")
         lora_path_generator = getattr(args, "lora_path_generator", "")
         lora_path_fake = getattr(args, "lora_path_fake_score", "")
         lora_path_high = getattr(args, "lora_path_high_noise", "")
@@ -52,17 +50,14 @@ class BaseModel(nn.Module):
             is_causal=self.is_causal,
             timestep_bound=self.boundary_step,
             target=self.training_target,
-            lora_rank=max(lora_rank_gen, lora_rank_critic),
+            lora_rank_generator=lora_rank_gen,
+            lora_rank_critic=lora_rank_critic,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
             apply_lora=True,
             train_lora_only=True
         )
         shared.set_adapter_role("generator")
-        # Optionally merge a style LoRA into the base weights before training adapters
-        if lora_path_style:
-            shared.load_lora(lora_path_style, adapter_role=lora_style_role)
-            merge_lora_weights(shared.model, adapter_role=lora_style_role)
         if lora_rank_gen > 0 and lora_path_generator:
             shared.load_lora(lora_path_generator, adapter_role="generator")
         if lora_rank_critic > 0 and lora_path_fake:
@@ -81,7 +76,8 @@ class BaseModel(nn.Module):
                 is_causal=False,
                 timestep_bound=self.boundary_step,
                 target="high_noise",
-                lora_rank=lora_rank if apply_lora_high else 0,
+                lora_rank_generator=lora_rank_gen if apply_lora_high else 0,
+                lora_rank_critic=0,
                 lora_alpha=lora_alpha,
                 lora_dropout=lora_dropout,
                 apply_lora=apply_lora_high,
@@ -92,7 +88,7 @@ class BaseModel(nn.Module):
             weights = {f"model.{k}": v for k, v in weights.items()}
             self.high_noise_model.load_state_dict(weights, strict=True)
             self.high_noise_model.model.requires_grad_(False)
-            if apply_lora_high and lora_rank > 0 and lora_path_high:
+            if apply_lora_high and lora_rank_gen > 0 and lora_path_high:
                 self.high_noise_model.set_adapter_role("generator")
                 self.high_noise_model.load_lora(lora_path_high, adapter_role="generator")
 

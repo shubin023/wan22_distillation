@@ -200,6 +200,8 @@ class WanDiffusionWrapper(torch.nn.Module):
             timestep_bound=0,
             target="high_noise",
             lora_rank: int = 0,
+            lora_rank_generator: Optional[int] = None,
+            lora_rank_critic: Optional[int] = None,
             lora_alpha: float = 4.0,
             lora_dropout: float = 0.0,
             apply_lora: bool = True,
@@ -222,9 +224,18 @@ class WanDiffusionWrapper(torch.nn.Module):
             self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
         self.model.eval()
 
+        lora_rank_generator = lora_rank if lora_rank_generator is None else lora_rank_generator
+        lora_rank_critic = lora_rank if lora_rank_critic is None else lora_rank_critic
+
         # Optionally inject LoRA adapters into WanAttentionBlock projections/FFN
-        if apply_lora and lora_rank > 0:
-            inject_lora_into_attention(self.model, lora_rank, lora_alpha, lora_dropout)
+        if apply_lora and (lora_rank_generator > 0 or lora_rank_critic > 0):
+            inject_lora_into_attention(
+                self.model,
+                lora_rank_generator,
+                lora_rank_critic,
+                lora_alpha,
+                lora_dropout,
+            )
             if train_lora_only:
                 # freeze base weights, leave LoRA params trainable
                 for n, p in self.model.named_parameters():
@@ -245,10 +256,10 @@ class WanDiffusionWrapper(torch.nn.Module):
             load_lora_weights(self.model, lora_path, adapter_role=adapter_role)
 
         # For non-causal diffusion, all frames share the same timestep
-        self.uniform_timestep = not is_causal
+        self.uniform_timestep = not self.is_causal
 
         self.scheduler = FlowMatchScheduler(
-            shift=timestep_shift, sigma_min=0.0, extra_one_step=True
+            shift=self.timestep_shift, sigma_min=0.0, extra_one_step=True
         )
         self.scheduler.set_timesteps(1000, training=True)
 
@@ -484,22 +495,35 @@ class LoraLinear(nn.Module):
     Lightweight LoRA wrapper around a frozen Linear.
     Holds two adapters (generator and critic) and selects one via adapter_role/active_adapter.
     """
-    def __init__(self, linear: nn.Linear, rank: int, alpha: float, dropout: float):
+    def __init__(
+        self,
+        linear: nn.Linear,
+        rank_generator: int,
+        rank_critic: int,
+        alpha: float,
+        dropout: float,
+    ):
         super().__init__()
         self.in_features = linear.in_features
         self.out_features = linear.out_features
-        self.rank = rank
-        self.scaling = alpha / rank if rank > 0 else 0.0
+        self.rank_generator = rank_generator
+        self.rank_critic = rank_critic
+        self.scaling_generator = alpha / rank_generator if rank_generator > 0 else 0.0
+        self.scaling_critic = alpha / rank_critic if rank_critic > 0 else 0.0
         self.base_weight = linear.weight
         self.base_bias = linear.bias
         self.base_weight.requires_grad_(False)
         if self.base_bias is not None:
             self.base_bias.requires_grad_(False)
         # Separate adapters for generator and critic roles
-        self.lora_A_generator = nn.Linear(self.in_features, rank, bias=False)
-        self.lora_B_generator = nn.Linear(rank, self.out_features, bias=False)
-        self.lora_A_critic = nn.Linear(self.in_features, rank, bias=False)
-        self.lora_B_critic = nn.Linear(rank, self.out_features, bias=False)
+        self.lora_A_generator = (
+            nn.Linear(self.in_features, rank_generator, bias=False) if rank_generator > 0 else None
+        )
+        self.lora_B_generator = (
+            nn.Linear(rank_generator, self.out_features, bias=False) if rank_generator > 0 else None
+        )
+        self.lora_A_critic = nn.Linear(self.in_features, rank_critic, bias=False) if rank_critic > 0 else None
+        self.lora_B_critic = nn.Linear(rank_critic, self.out_features, bias=False) if rank_critic > 0 else None
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.active_adapter = "generator"  # default role; can be changed per-wrapper
 
@@ -509,9 +533,15 @@ class LoraLinear(nn.Module):
         if role == "none":
             lora_update = 0.0
         elif role == "critic":
-            lora_update = self.lora_B_critic(self.lora_A_critic(self.dropout(x))) * self.scaling
+            if self.lora_A_critic is None or self.lora_B_critic is None:
+                lora_update = 0.0
+            else:
+                lora_update = self.lora_B_critic(self.lora_A_critic(self.dropout(x))) * self.scaling_critic
         else:
-            lora_update = self.lora_B_generator(self.lora_A_generator(self.dropout(x))) * self.scaling
+            if self.lora_A_generator is None or self.lora_B_generator is None:
+                lora_update = 0.0
+            else:
+                lora_update = self.lora_B_generator(self.lora_A_generator(self.dropout(x))) * self.scaling_generator
         return base + lora_update
 
     def merge_lora(self, adapter_role: str = "generator", reset_after: bool = True):
@@ -520,13 +550,19 @@ class LoraLinear(nn.Module):
         W := W + (B @ A) * scaling. Optionally zero the adapter weights afterward.
         """
         if adapter_role == "critic":
+            if self.lora_A_critic is None or self.lora_B_critic is None:
+                return
             A = self.lora_A_critic.weight
             B = self.lora_B_critic.weight
+            scaling = self.scaling_critic
         else:
+            if self.lora_A_generator is None or self.lora_B_generator is None:
+                return
             A = self.lora_A_generator.weight
             B = self.lora_B_generator.weight
+            scaling = self.scaling_generator
 
-        delta = torch.matmul(B, A) * self.scaling  # [out, in]
+        delta = torch.matmul(B, A) * scaling  # [out, in]
         with torch.no_grad():
             self.base_weight.add_(delta)
             if reset_after:
@@ -550,30 +586,36 @@ def _load_lora_state_dict(path: str) -> dict:
     raise ValueError(f"Unsupported LoRA checkpoint format at {path}")
 
 
-def inject_lora_into_attention(model: nn.Module, rank: int, alpha: float, dropout: float):
+def inject_lora_into_attention(
+    model: nn.Module,
+    rank_generator: int,
+    rank_critic: int,
+    alpha: float,
+    dropout: float,
+):
     """
     Recursively walk the WanModel and swap attention/FFN linear layers in WanAttentionBlock
     with LoraLinear wrappers.
     """
-    if rank <= 0:
+    if rank_generator <= 0 and rank_critic <= 0:
         return
     for module in model.modules():
         if isinstance(module, WanAttentionBlock):
             # Self-attention projections
-            module.self_attn.q = LoraLinear(module.self_attn.q, rank, alpha, dropout)
-            module.self_attn.k = LoraLinear(module.self_attn.k, rank, alpha, dropout)
-            module.self_attn.v = LoraLinear(module.self_attn.v, rank, alpha, dropout)
-            module.self_attn.o = LoraLinear(module.self_attn.o, rank, alpha, dropout)
+            module.self_attn.q = LoraLinear(module.self_attn.q, rank_generator, rank_critic, alpha, dropout)
+            module.self_attn.k = LoraLinear(module.self_attn.k, rank_generator, rank_critic, alpha, dropout)
+            module.self_attn.v = LoraLinear(module.self_attn.v, rank_generator, rank_critic, alpha, dropout)
+            module.self_attn.o = LoraLinear(module.self_attn.o, rank_generator, rank_critic, alpha, dropout)
             # Cross-attention projections
-            module.cross_attn.q = LoraLinear(module.cross_attn.q, rank, alpha, dropout)
-            module.cross_attn.k = LoraLinear(module.cross_attn.k, rank, alpha, dropout)
-            module.cross_attn.v = LoraLinear(module.cross_attn.v, rank, alpha, dropout)
-            module.cross_attn.o = LoraLinear(module.cross_attn.o, rank, alpha, dropout)
+            module.cross_attn.q = LoraLinear(module.cross_attn.q, rank_generator, rank_critic, alpha, dropout)
+            module.cross_attn.k = LoraLinear(module.cross_attn.k, rank_generator, rank_critic, alpha, dropout)
+            module.cross_attn.v = LoraLinear(module.cross_attn.v, rank_generator, rank_critic, alpha, dropout)
+            module.cross_attn.o = LoraLinear(module.cross_attn.o, rank_generator, rank_critic, alpha, dropout)
             # FFN (first and last linear in the Sequential)
             if isinstance(module.ffn[0], nn.Linear):
-                module.ffn[0] = LoraLinear(module.ffn[0], rank, alpha, dropout)
+                module.ffn[0] = LoraLinear(module.ffn[0], rank_generator, rank_critic, alpha, dropout)
             if isinstance(module.ffn[-1], nn.Linear):
-                module.ffn[-1] = LoraLinear(module.ffn[-1], rank, alpha, dropout)
+                module.ffn[-1] = LoraLinear(module.ffn[-1], rank_generator, rank_critic, alpha, dropout)
 
 
 def load_lora_weights(model: nn.Module, lora_path: str, adapter_role: str = "generator"):

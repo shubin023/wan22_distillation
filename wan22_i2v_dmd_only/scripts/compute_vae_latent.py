@@ -1,7 +1,5 @@
 from utils.wan_wrapper import WanVAEWrapper
-import torch.distributed as dist
 import imageio.v3 as iio
-from datetime import timedelta, datetime
 from tqdm import tqdm
 import argparse
 import torch
@@ -11,22 +9,6 @@ import os
 import glob
 
 torch.set_grad_enabled(False)
-
-
-def launch_distributed_job(backend: str = "nccl"):
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    host = os.environ["MASTER_ADDR"]
-    port = int(os.environ["MASTER_PORT"])
-
-    if ":" in host:  # IPv6
-        init_method = f"tcp://[{host}]:{port}"
-    else:  # IPv4
-        init_method = f"tcp://{host}:{port}"
-    dist.init_process_group(rank=rank, world_size=world_size, backend=backend,
-                            init_method=init_method, timeout=timedelta(minutes=30))
-    torch.cuda.set_device(local_rank)
 
 
 def video_to_numpy(video_path):
@@ -70,12 +52,8 @@ def main():
     torch.backends.cudnn.allow_tf32 = True
     torch.set_grad_enabled(False)
 
-    # Initialize distributed environment
-    launch_distributed_job()
-    device = torch.cuda.current_device()
-
-    global_rank = dist.get_rank()
-    is_main_process = (global_rank == 0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    is_main_process = True
 
     # Get all video files from input folder
     video_extensions = ['*.mp4', '*.avi', '*.mov', '*.mkv', '*.webm']
@@ -121,12 +99,7 @@ def main():
         print(f"processing {len(prompt_video_pairs)} prompt video pairs ...")
 
     # Process each prompt:video pair
-    for index in range(int(math.ceil(len(prompt_video_pairs) / dist.get_world_size()))):
-        global_index = index * dist.get_world_size() + dist.get_rank()
-        if global_index >= len(prompt_video_pairs):
-            break
-
-        prompt, video_path = prompt_video_pairs[global_index]
+    for global_index, (prompt, video_path) in enumerate(prompt_video_pairs):
         output_path = os.path.join(args.output_latent_folder, f"{global_index:08d}.pt")
         
         # Check if video file exists
@@ -175,26 +148,11 @@ def main():
         if global_index % 200 == 0:
             print(f"process {global_index} finished.")
 
-    # Convert counters to tensors for all_reduce
-    total_videos_tensor = torch.tensor(total_videos, device=device)
-    skipped_videos_tensor = torch.tensor(skipped_videos, device=device)
-    successful_encodings_tensor = torch.tensor(successful_encodings, device=device)
-    failed_encodings_tensor = torch.tensor(failed_encodings, device=device)
-
-    # Sum up counters across all processes
-    dist.all_reduce(total_videos_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(skipped_videos_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(successful_encodings_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(failed_encodings_tensor, op=dist.ReduceOp.SUM)
-
-    if dist.get_rank() == 0:
-        print("\nProcessing Statistics:")
-        print(f"Total videos processed: {total_videos_tensor.item()}")
-        print(f"Skipped videos (not found): {skipped_videos_tensor.item()}")
-        print(f"Successfully encoded: {successful_encodings_tensor.item()}")
-        print(f"Failed to encode: {failed_encodings_tensor.item()}")
-
-    dist.barrier()
+    print("\nProcessing Statistics:")
+    print(f"Total videos processed: {total_videos}")
+    print(f"Skipped videos (not found): {skipped_videos}")
+    print(f"Successfully encoded: {successful_encodings}")
+    print(f"Failed to encode: {failed_encodings}")
 
 
 if __name__ == "__main__":
