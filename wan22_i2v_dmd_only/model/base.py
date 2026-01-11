@@ -2,7 +2,6 @@ from typing import Tuple
 from einops import rearrange
 from torch import nn
 from safetensors.torch import load_file
-import torch.distributed as dist
 import torch
 import os
 
@@ -31,17 +30,20 @@ class BaseModel(nn.Module):
         self.x_bound = None
 
     def _initialize_models(self, args, device):
+        self.model_name = getattr(args, "model_name", "Wan2.2-I2V-A14B")
         self.real_model_name = getattr(args, "real_name", "Wan2.2-T2V-A14B")
         self.fake_model_name = getattr(args, "fake_name", "Wan2.2-T2V-A14B")
         self.generator_name = getattr(args, "generator_name", "Wan2.2-T2V-A14B")
         lora_rank_gen = getattr(args, "lora_rank", 0)
         lora_rank_critic = getattr(args, "lora_rank_critic", lora_rank_gen)
         lora_alpha = getattr(args, "lora_alpha", 4.0)
+        lora_alpha_gen = getattr(args, "lora_alpha_generator", lora_alpha)
+        lora_alpha_critic = getattr(args, "lora_alpha_critic", lora_alpha)
         lora_dropout = getattr(args, "lora_dropout", 0.0)
-        apply_lora_high = getattr(args, "lora_apply_to_high_noise", False)
+        lora_dropout_gen = getattr(args, "lora_dropout_generator", lora_dropout)
+        lora_dropout_critic = getattr(args, "lora_dropout_critic", lora_dropout)
         lora_path_generator = getattr(args, "lora_path_generator", "")
         lora_path_fake = getattr(args, "lora_path_fake_score", "")
-        lora_path_high = getattr(args, "lora_path_high_noise", "")
 
         # Shared backbone with dual-role LoRAs; base weights frozen
         shared = WanDiffusionWrapper(
@@ -52,8 +54,10 @@ class BaseModel(nn.Module):
             target=self.training_target,
             lora_rank_generator=lora_rank_gen,
             lora_rank_critic=lora_rank_critic,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
+            lora_alpha_generator=lora_alpha_gen,
+            lora_alpha_critic=lora_alpha_critic,
+            lora_dropout_generator=lora_dropout_gen,
+            lora_dropout_critic=lora_dropout_critic,
             apply_lora=True,
             train_lora_only=True
         )
@@ -62,6 +66,8 @@ class BaseModel(nn.Module):
             shared.load_lora(lora_path_generator, adapter_role="generator")
         if lora_rank_critic > 0 and lora_path_fake:
             shared.load_lora(lora_path_fake, adapter_role="critic")
+        target_dtype = torch.bfloat16 if args.mixed_precision else torch.float32
+        shared.model = shared.model.to(device=device, dtype=target_dtype)
 
         # Reuse the same module for generator, critic, and teacher (LoRA disabled via adapter_role)
         self.generator = shared
@@ -76,26 +82,24 @@ class BaseModel(nn.Module):
                 is_causal=False,
                 timestep_bound=self.boundary_step,
                 target="high_noise",
-                lora_rank_generator=lora_rank_gen if apply_lora_high else 0,
+                lora_rank_generator=0,
                 lora_rank_critic=0,
-                lora_alpha=lora_alpha,
-                lora_dropout=lora_dropout,
-                apply_lora=apply_lora_high,
-                train_lora_only=apply_lora_high
+                lora_alpha_generator=lora_alpha_gen,
+                lora_alpha_critic=lora_alpha_critic,
+                lora_dropout_generator=lora_dropout_gen,
+                lora_dropout_critic=lora_dropout_critic,
+                apply_lora=False,
+                train_lora_only=False
             )
-            distill_path = os.path.join("./wan_models", getattr(args, "high_noise_distill_ckpt", ""))
-            weights = load_file(distill_path)
-            weights = {f"model.{k}": v for k, v in weights.items()}
-            self.high_noise_model.load_state_dict(weights, strict=True)
             self.high_noise_model.model.requires_grad_(False)
-            if apply_lora_high and lora_rank_gen > 0 and lora_path_high:
-                self.high_noise_model.set_adapter_role("generator")
-                self.high_noise_model.load_lora(lora_path_high, adapter_role="generator")
+            self.high_noise_model.model = self.high_noise_model.model.to(
+                device=device, dtype=target_dtype
+            )
 
-        self.text_encoder = WanTextEncoder(model_name=self.generator_name)
+        self.text_encoder = WanTextEncoder(model_name=self.model_name)
         self.text_encoder.requires_grad_(False)
 
-        self.vae = WanVAEWrapper(model_name=self.generator_name)
+        self.vae = WanVAEWrapper(model_name=self.model_name)
         self.vae.requires_grad_(False)
 
         self.scheduler = self.generator.get_scheduler()
@@ -194,7 +198,6 @@ class SelfForcingModel(BaseModel):
         max_num_blocks = max_num_frames // self.num_frame_per_block
         min_num_blocks = min_num_frames // self.num_frame_per_block
         num_generated_blocks = torch.randint(min_num_blocks, max_num_blocks + 1, (1,), device=self.device)
-        dist.broadcast(num_generated_blocks, src=0)
         num_generated_blocks = num_generated_blocks.item()
         num_generated_frames = num_generated_blocks * self.num_frame_per_block
         if self.args.independent_first_frame and initial_latent is None:

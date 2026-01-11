@@ -3,8 +3,6 @@ import torch
 
 from utils.wan_wrapper import WanDiffusionWrapper
 from utils.scheduler import SchedulerInterface
-import torch.distributed as dist
-from torch.utils.checkpoint import checkpoint
 
 
 class BidirectionalTrainingPipeline(torch.nn.Module):
@@ -32,20 +30,12 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
                 (self.timestep_bound / 1000) / (1 + (self.scheduler.shift - 1) * (self.timestep_bound / 1000)) * 1000
 
     def generate_and_sync_list(self, num_denoising_steps, device):
-        rank = dist.get_rank() if dist.is_initialized() else 0
-
-        if rank == 0:
-            # Generate random indices
-            indices = torch.randint(
-                low=0,
-                high=num_denoising_steps,
-                size=(1,),
-                device=device
-            )
-        else:
-            indices = torch.empty(1, dtype=torch.long, device=device)
-
-        dist.broadcast(indices, src=0)  # Broadcast the random indices to all ranks
+        indices = torch.randint(
+            low=0,
+            high=num_denoising_steps,
+            size=(1,),
+            device=device
+        )
         return indices.tolist()
 
     def inference_with_trajectory(self, noise: torch.Tensor, y, **conditional_dict) -> torch.Tensor:

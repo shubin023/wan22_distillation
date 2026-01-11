@@ -19,4 +19,4 @@ torchrun \
   --config_path configs/wan22_high_i2v.yaml \
   --logdir "${LOGDIR}" \
   --no_visualize \
-  --disable-wandb
+  --disable-mlflow

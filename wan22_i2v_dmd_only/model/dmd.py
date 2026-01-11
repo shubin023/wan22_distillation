@@ -5,7 +5,6 @@ from typing import Optional, Tuple
 import torch
 from utils.wan_wrapper import WanDiffusionWrapper
 from model.base import SelfForcingModel
-import torch.distributed as dist
 
 
 class DMD(SelfForcingModel):
@@ -28,7 +27,6 @@ class DMD(SelfForcingModel):
             self.generator.model.independent_first_frame = True
         if args.gradient_checkpointing:
             self.generator.enable_gradient_checkpointing()
-            self.fake_score.enable_gradient_checkpointing()
 
         # this will be init later with fsdp-wrapped modules
         self.inference_pipeline: SelfForcingTrainingPipeline = None
@@ -87,6 +85,7 @@ class DMD(SelfForcingModel):
             - kl_log_dict: a dictionary containing the intermediate tensors for logging.
         """
         # Step 1: Compute the fake score
+        print("[DMD] fake_score forward start")
         _, pred_fake_image = self.fake_score(
             noisy_image_or_video=noisy_image_or_video,
             conditional_dict=conditional_dict,
@@ -96,6 +95,7 @@ class DMD(SelfForcingModel):
         )
 
         # Step 2: Compute the real score
+        print("[DMD] real_score forward start (conditional)")
         # We compute the conditional and unconditional prediction
         # and add them together to achieve cfg (https://arxiv.org/abs/2207.12598)
         _, pred_real_image_cond = self.real_score(
@@ -106,6 +106,7 @@ class DMD(SelfForcingModel):
             adapter_role="none"
         )
 
+        print("[DMD] real_score forward start (unconditional)")
         _, pred_real_image_uncond = self.real_score(
             noisy_image_or_video=noisy_image_or_video,
             conditional_dict=unconditional_dict,
@@ -249,8 +250,7 @@ class DMD(SelfForcingModel):
             y=y
         )
 
-        if (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0:
-            print(f"dmd_loss: {dmd_loss.item()}")
+        print(f"dmd_loss: {dmd_loss.item()}")
 
         del flow_pred, pred_image, gradient_mask
 
@@ -320,12 +320,12 @@ class DMD(SelfForcingModel):
                 self.timestep_bound
             ).unflatten(0, image_or_video_shape[:2])
 
+        self.fake_score.set_adapter_role("critic")
         flow_pred_fake, _ = self.fake_score(
             noisy_image_or_video=noisy_generated_image,
             conditional_dict=conditional_dict,
             timestep_id=critic_timestep_id,
-            y=y,
-            adapter_role="critic"
+            y=y
         )
         if self.training_target == "high_noise":
             self.scheduler.sigmas = self.scheduler.sigmas.to(noisy_generated_image.device)
@@ -339,8 +339,7 @@ class DMD(SelfForcingModel):
             s = self.sigma_bound.to(noisy_generated_image.device)
             fake_image = noisy_generated_image - flow_pred_fake * t
         denoising_loss = torch.mean((fake_image - generated_image) ** 2)
-        if (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0:
-            print(f"denoising_loss: {denoising_loss.item()}")
+        print(f"denoising_loss: {denoising_loss.item()}")
 
         # Step 5: Debugging Log
         critic_log_dict = {

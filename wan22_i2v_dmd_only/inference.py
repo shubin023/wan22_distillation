@@ -74,7 +74,7 @@ pipeline = pipeline.to(device=device, dtype=torch.bfloat16)
 if args.i2v:
     assert not dist.is_initialized(), "I2V does not support distributed inference yet"
     transform = transforms.Compose([
-        transforms.Resize((480, 832)),
+        transforms.Resize((832, 480)),
         transforms.ToTensor(),
         transforms.Normalize([0.5], [0.5])
     ])
@@ -137,7 +137,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         initial_latent = initial_latent.repeat(args.num_samples, 1, 1, 1, 1)
 
         sampled_noise = torch.randn(
-            [args.num_samples, args.num_output_frames - 1, 16, 60, 104], device=device, dtype=torch.bfloat16
+            [args.num_samples, args.num_output_frames - 1, 16, 104, 60], device=device, dtype=torch.bfloat16
         )
     else:
         # For text-to-video, batch is just the text prompt
@@ -150,7 +150,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         initial_latent = None
 
         sampled_noise = torch.randn(
-            [args.num_samples, args.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
+            [args.num_samples, args.num_output_frames, 16, 104, 60], device=device, dtype=torch.bfloat16
         )
 
     # Generate 81 frames

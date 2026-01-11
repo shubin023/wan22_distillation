@@ -9,24 +9,41 @@ num_training_frames: 21
 gc_interval: 100
 context_noise: 0
 causal: true
+precompute_x_bound: false
+precompute_x_bound_offload: false
+precompute_x_bound_reload: false
+use_precomputed_prompt_embeds: false
+use_precomputed_image_embeds: false
+prompt_embeds_dir: ""
+image_embeds_dir: ""
+mlflow_tracking_uri: ""
+mlflow_experiment: "wan22_i2v_dmd"
+mlflow_run_name: ""
+disable_mlflow: false
 
 ckpt_step: 0
+resume_step: 0
+resume_ckpt: ""
+max_grad_norm_generator: 10.0
+max_grad_norm_critic: 10.0
 prompt_name: MovieGenVideoBench
 prompt_path: prompts/MovieGenVideoBench.txt
 eval_first_n: 64
 num_samples: 1
-height: 480
-width: 832
+height: 832
+width: 480
 num_frames: 81
 
 # LoRA (optional). Set lora_rank > 0 to enable LoRA adapters on generator/fake_score.
 lora_rank: 0
 lora_rank_critic: 0
 lora_alpha: 4.0
+lora_alpha_generator: 4.0
+lora_alpha_critic: 4.0
 lora_dropout: 0.0
+lora_dropout_generator: 0.0
+lora_dropout_critic: 0.0
 lora_apply_to_high_noise: false
-lora_path_style: ""
-lora_path_style_role: generator
 lora_path_generator: ""
 lora_path_fake_score: ""
 lora_path_high_noise: ""

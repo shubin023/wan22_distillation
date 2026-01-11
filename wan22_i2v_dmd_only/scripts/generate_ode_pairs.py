@@ -63,7 +63,7 @@ def main():
         conditional_dict = encoder(text_prompts=prompt)
 
         latents = torch.randn(
-            [1, 21, 16, 60, 104], dtype=torch.float32, device=device
+            [1, 21, 16, 104, 60], dtype=torch.float32, device=device
         )
 
         noisy_input = []

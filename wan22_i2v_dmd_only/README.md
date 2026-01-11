@@ -38,7 +38,7 @@ torchrun --nnodes=8 --nproc_per_node=8 \
   train.py \
   --config_path configs/wan22_high_i2v.yaml \
   --logdir logs/wan22_high_i2v \
-  --no_visualize --disable-wandb
+  --no_visualize --disable-mlflow
 ```
 
 Convert the high-noise checkpoint for stage 2:
@@ -56,7 +56,7 @@ torchrun --nnodes=8 --nproc_per_node=8 \
   train.py \
   --config_path configs/wan22_low_i2v.yaml \
   --logdir logs/wan22_low_i2v \
-  --no_visualize --disable-wandb
+  --no_visualize --disable-mlflow
 ```
 
 Notes:

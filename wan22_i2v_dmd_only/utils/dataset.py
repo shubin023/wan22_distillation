@@ -55,45 +55,28 @@ class TextFolderDataset(Dataset):
         return {"prompts": self.texts[idx], "idx": idx}
 
 
-class ODERegressionLMDBDataset(Dataset):
-    def __init__(self, data_path: str, max_pair: int = int(1e8)):
-        self.env = lmdb.open(data_path, readonly=True,
-                             lock=False, readahead=False, meminit=False)
-
-        self.latents_shape = get_array_shape_from_lmdb(self.env, 'latents')
-        self.max_pair = max_pair
-
-    def __len__(self):
-        return min(self.latents_shape[0], self.max_pair)
-
-    def __getitem__(self, idx):
-        """
-        Outputs:
-            - prompts: List of Strings
-            - latents: Tensor of shape (num_denoising_steps, num_frames, num_channels, height, width). It is ordered from pure noise to clean image.
-        """
-        latents = retrieve_row_from_lmdb(
-            self.env,
-            "latents", np.float16, idx, shape=self.latents_shape[1:]
-        )
-
-        if len(latents.shape) == 4:
-            latents = latents[None, ...]
-
-        prompts = retrieve_row_from_lmdb(
-            self.env,
-            "prompts", str, idx
-        )
-        return {
-            "prompts": prompts,
-            "ode_latent": torch.tensor(latents, dtype=torch.float32)
-        }
-
-
 class ShardingLMDBDataset(Dataset):
-    def __init__(self, data_path: str, max_pair: int = int(1e8)):
+    def __init__(
+        self,
+        data_path: str,
+        max_pair: int = int(1e8),
+        prompt_embeds_dir: str = "",
+        image_embeds_dir: str = "",
+        embeds_device: torch.device | None = None,
+        embeds_dtype: torch.dtype = torch.float32,
+    ):
         self.envs = []
         self.index = []
+        if embeds_device is None:
+            embeds_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.embeds_device = embeds_device
+        self.embeds_dtype = embeds_dtype
+        self.prompt_embeds_cache = self._load_embeddings_from_dir(
+            prompt_embeds_dir, device=self.embeds_device, dtype=self.embeds_dtype
+        )
+        self.image_embeds_cache = self._load_embeddings_from_dir(
+            image_embeds_dir, device=self.embeds_device, dtype=self.embeds_dtype
+        )
 
         for fname in sorted(os.listdir(data_path)):
             path = os.path.join(data_path, fname)
@@ -121,18 +104,8 @@ class ShardingLMDBDataset(Dataset):
         """
             Outputs:
                 - prompts: List of Strings
-                - latents: Tensor of shape (num_denoising_steps, num_frames, num_channels, height, width). It is ordered from pure noise to clean image.
         """
         shard_id, local_idx = self.index[idx]
-
-        latents = retrieve_row_from_lmdb(
-            self.envs[shard_id],
-            "latents", np.float16, local_idx,
-            shape=self.latents_shape[shard_id][1:]
-        )
-
-        if len(latents.shape) == 4:
-            latents = latents[None, ...]
 
         prompts = retrieve_row_from_lmdb(
             self.envs[shard_id],
@@ -142,16 +115,53 @@ class ShardingLMDBDataset(Dataset):
         img = retrieve_row_from_lmdb(
             self.envs[shard_id],
             "img", np.uint8, local_idx,
-            shape=(480, 832, 3)
+            shape=(832, 480, 3)
         )
         img = Image.fromarray(img)
         img = TF.to_tensor(img).sub_(0.5).div_(0.5)
 
-        return {
+        prompt_embeds = None
+        if self.prompt_embeds_cache is not None:
+            if idx not in self.prompt_embeds_cache:
+                raise KeyError(f"prompt_embeds not found for idx {idx}")
+            prompt_embeds = self.prompt_embeds_cache[idx]
+        image_embeds = None
+        if self.image_embeds_cache is not None:
+            if idx not in self.image_embeds_cache:
+                raise KeyError(f"image_embeds not found for idx {idx}")
+            image_embeds = self.image_embeds_cache[idx]
+
+        sample = {
             "prompts": prompts,
-            "ode_latent": torch.tensor(latents, dtype=torch.float32),
-            "img": img
+            "img": img,
+            "idx": idx
         }
+        if prompt_embeds is not None:
+            sample["prompt_embeds"] = prompt_embeds
+        if image_embeds is not None:
+            sample["image_embeds"] = image_embeds
+        return sample
+
+    @staticmethod
+    def _load_embeddings_from_dir(
+        path: str,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        if not path:
+            return None
+        if not os.path.isdir(path):
+            raise FileNotFoundError(f"Embeddings directory not found: {path}")
+        cache = {}
+        for fname in os.listdir(path):
+            if not fname.endswith(".pt"):
+                continue
+            stem = os.path.splitext(fname)[0]
+            if not stem.isdigit():
+                continue
+            tensor = torch.load(os.path.join(path, fname), map_location="cpu")
+            cache[int(stem)] = tensor.to(device=device, dtype=dtype)
+        return cache
 
 
 class TextImagePairDataset(Dataset):

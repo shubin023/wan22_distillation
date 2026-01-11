@@ -90,8 +90,8 @@ def main():
             print(f"Error processing {file}: {e}")
             continue
 
-        # if data_dict["latents"].shape != (1, 21, 16, 60, 104):
-        #     continue
+        if data_dict["latents"].shape != (1, 21, 16, 104, 60):
+            continue
 
         # if len(data_dict['prompts'][0]) < 300:
         #     continue

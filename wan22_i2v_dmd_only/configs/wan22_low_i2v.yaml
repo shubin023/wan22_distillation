@@ -1,18 +1,28 @@
 i2v: true
 training_target: low_noise
+model_name: Wan2.2-I2V-A14B
 real_name: Wan2.2-I2V-A14B/low_noise_model
 fake_name: Wan2.2-I2V-A14B/low_noise_model
 generator_type: bidirectional
 generator_name: Wan2.2-I2V-A14B/low_noise_model
 high_noise_name: Wan2.2-I2V-A14B/high_noise_model
-high_noise_distill_ckpt: Wan2.2-I2V-A14B/distill_models/high_noise_model/distill_model.safetensors
+precompute_x_bound: true
+precompute_x_bound_reload: true
+use_precomputed_prompt_embeds: true
+use_precomputed_image_embeds: true
+prompt_embeds_dir: /data/mydataset/prompt_embeds
+image_embeds_dir: /data/mydataset/image_embeds
 text_encoder_cpu_offload: true
 denoising_step_list:
 - 500
+- 375
 - 250
+- 125
 high_noise_step_list:
 - 1000
+- 875
 - 750
+- 625
 boundary_step: 500
 warp_denoising_step: true # need to remove - 0 in denoising_step_list if warp_denoising_step is true
 ts_schedule: false
@@ -22,10 +32,9 @@ guidance_scale: 3.5
 denoising_loss_type: flow
 mixed_precision: true
 seed: 0
-wandb_host: WANDB_HOST
-wandb_key: WANDB_KEY
-wandb_entity: WANDB_ENTITY
-wandb_project: WANDB_PROJECT
+mlflow_tracking_uri: ""
+mlflow_experiment: "wan22_i2v_dmd"
+mlflow_run_name: ""
 lr: 2.0e-06
 lr_critic: 4.0e-07
 beta1: 0.0
@@ -44,8 +53,8 @@ image_or_video_shape:
 - 1
 - 21
 - 16
-- 60
 - 104
+- 60
 distribution_loss: dmd
 trainer: score_distillation
 gradient_checkpointing: true
